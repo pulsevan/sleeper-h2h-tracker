@@ -17,6 +17,7 @@ NAME_MAPPING = {
 import html
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 import requests
 import streamlit as st
@@ -93,6 +94,52 @@ def fetch_matchups(league_id: str, last_week: int) -> dict:
         return dict(pool.map(one, weeks))
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_nfl_state() -> dict:
+    """Sleeper's current NFL state (season, week, season_type, ...)."""
+    data = _get_json(f"{API_BASE}/state/nfl")
+    return data if isinstance(data, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# Current-week / in-progress detection
+# ---------------------------------------------------------------------------
+def now_eastern() -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:  # tzdata unavailable: approximate with a fixed EST offset
+        return datetime.now(timezone(timedelta(hours=-5)))
+
+
+def is_week_in_progress(now: datetime | None = None) -> bool:
+    """True from Thursday through Monday, and Tuesday before 6 AM ET.
+
+    Games run Thursday night through Monday night; Sleeper finalizes scores early Tuesday.
+    """
+    now = now or now_eastern()
+    weekday = now.weekday()  # Monday = 0 ... Sunday = 6
+    if weekday in (3, 4, 5, 6, 0):
+        return True
+    if weekday == 1:
+        return now.hour < 6
+    return False
+
+
+def get_active_week(league: dict, state: dict):
+    """The league's current regular-season NFL week, or None if the league isn't live."""
+    try:
+        if str(state.get("season")) != str(league.get("season")):
+            return None
+        if state.get("season_type") != "regular":
+            return None
+        week = int(state.get("week") or 0)
+        return week if week >= 1 else None
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Data processing
 # ---------------------------------------------------------------------------
@@ -133,8 +180,11 @@ def build_names(users: list, rosters: list) -> dict:
     return names
 
 
-def build_games(matchups_by_week: dict, names: dict) -> list:
-    """Pair up teams by matchup_id and build one game record per team per week."""
+def build_games(matchups_by_week: dict, names: dict, live_week: int | None = None) -> list:
+    """Pair up teams by matchup_id and build one game record per team per week.
+
+    Games in `live_week` (the in-progress week) are flagged `live=True`.
+    """
     games = []
     for week, entries in sorted(matchups_by_week.items()):
         by_id = {}
@@ -161,6 +211,7 @@ def build_games(matchups_by_week: dict, names: dict) -> list:
                         "pf": pf,
                         "pa": pa,
                         "result": result,
+                        "live": week == live_week,
                     }
                 )
     return games
@@ -285,6 +336,9 @@ THEME_VARS = {
     # Positive / negative numbers on a normal cell vs. on a pastel cell
     "--pos-text": ("#17692a", "#4ade80"),
     "--neg-text": ("#a61b1b", "#f87171"),
+    # Live (in-progress) week row
+    "--live-bg": ("#fff1cc", "#4a3b12"),
+    "--live-text": ("#7a4b00", "#fde68a"),
     "--pos-on-pastel": ("#14532d", "#14532d"),
     "--neg-on-pastel": ("#7f1d1d", "#7f1d1d"),
 }
@@ -347,6 +401,8 @@ table.t td.pos{color:var(--pos-text) !important;}
 table.t td.neg{color:var(--neg-text) !important;}
 table.t tr.diff td.pos{color:var(--pos-on-pastel) !important;}
 table.t tr.diff td.neg{color:var(--neg-on-pastel) !important;}
+table.t tr.live td{background-color:var(--live-bg) !important;color:var(--live-text) !important;
+  font-style:italic;}
 table.t td.left{text-align:left;}
 table.t td.stand{text-align:left;}
 .rk{display:inline-block;min-width:2em;font-weight:800;color:var(--accent-text) !important;}
@@ -429,11 +485,28 @@ def render_same_record_standings(groups) -> str:
 # ---------------------------------------------------------------------------
 # Tab renderers
 # ---------------------------------------------------------------------------
-def render_h2h_tab(season, subtitle, managers, overall, h2h, groups):
+def render_h2h_tab(season, subtitle, managers, overall, h2h, groups, through_week, live_mode):
+    """live_mode: None (no live week in view), "excluded" or "included"."""
     st.markdown(
         f'<div class="banner">HEAD TO HEAD MADNESS TRACKER v{esc(season)}</div>'
         f'<div class="pill-wrap"><span class="pill">{esc(subtitle)}</span></div>',
         unsafe_allow_html=True,
+    )
+    if live_mode == "excluded":
+        st.info(
+            f"Week {through_week} is currently in progress — live points are visible in Tab 2, "
+            "but W/L outcomes are not factored into standings until the week concludes.",
+            icon="⏳",
+        )
+    elif live_mode == "included":
+        st.warning(
+            f"Week {through_week} is currently in progress — its live (partial) results are being "
+            "counted in H2H records and standings and may change before the week ends.",
+            icon="⏳",
+        )
+    st.caption(
+        f"Records through Week {through_week}"
+        + (" (completed weeks only)" if live_mode == "excluded" else "")
     )
     cols = st.columns(2)
     for i, m in enumerate(managers):
@@ -448,20 +521,26 @@ def render_h2h_tab(season, subtitle, managers, overall, h2h, groups):
     st.markdown(render_same_record_standings(groups), unsafe_allow_html=True)
     st.caption(
         "Ties within a record are broken by head-to-head win % among the tied teams, "
-        "then by Sleeper's total Points For. Regular season only."
+        "then by Total Points For. Regular season only."
     )
 
 
-def render_scoring_tab(season, managers, games, weeks, total_pf_games):
+def render_scoring_tab(season, managers, display_games, counted_games, weeks, live_week, live_counted):
+    """Weekly grids show every game in `display_games` (including live, partial scores);
+    totals / averages / leaderboards use only `counted_games`."""
     pf = {}
     pa = {}
-    for g in games:
+    for g in display_games:
         pf[(g["week"], g["manager"])] = g["pf"]
         pa[(g["week"], g["manager"])] = g["pa"]
 
-    pf_tot = {m: sum(v for (w, mm), v in pf.items() if mm == m) for m in managers}
-    pa_tot = {m: sum(v for (w, mm), v in pa.items() if mm == m) for m in managers}
-    gp = {m: sum(1 for g in games if g["manager"] == m) for m in managers}
+    pf_tot = {m: 0.0 for m in managers}
+    pa_tot = {m: 0.0 for m in managers}
+    gp = {m: 0 for m in managers}
+    for g in counted_games:
+        pf_tot[g["manager"]] += g["pf"]
+        pa_tot[g["manager"]] += g["pa"]
+        gp[g["manager"]] += 1
     diff = {m: pf_tot[m] - pa_tot[m] for m in managers}
 
     st.markdown(
@@ -469,6 +548,19 @@ def render_scoring_tab(season, managers, games, weeks, total_pf_games):
         f'<div class="pill-wrap"><span class="pill">Regular Season {esc(season)}</span></div>',
         unsafe_allow_html=True,
     )
+    if live_week:
+        if live_counted:
+            st.warning(
+                f"Week {live_week} (Live) shows partial, in-progress scores and is included in "
+                "totals, averages and records.",
+                icon="⏳",
+            )
+        else:
+            st.info(
+                f"Week {live_week} (Live) shows partial, in-progress scores. It is excluded from "
+                "TOTAL, DIFFERENTIAL, averages and the leaderboard until the week concludes.",
+                icon="⏳",
+            )
 
     header = ["Week"] + [esc(m) for m in managers] + ["Total"]
 
@@ -477,10 +569,11 @@ def render_scoring_tab(season, managers, games, weeks, total_pf_games):
         for w in weeks:
             vals = [data.get((w, m)) for m in managers]
             played = [v for v in vals if v is not None]
-            cells = [("label", f"Week {w}")]
+            is_live = w == live_week
+            cells = [("label", f"Week {w} (Live)" if is_live else f"Week {w}")]
             cells += [("", money(v) if v is not None else "&ndash;") for v in vals]
             cells.append(("totalcol", money(sum(played)) if played else "&ndash;"))
-            rows.append(("", cells))
+            rows.append(("live" if is_live else "", cells))
         cells = [("label", "TOTAL")] + [("", money(totals[m])) for m in managers]
         cells.append(("totalcol", money(sum(totals.values()))))
         rows.append(("total", cells))
@@ -544,7 +637,6 @@ def main():
             st.rerun()
         link = LEAGUE_URL if league_id == DEFAULT_LEAGUE_ID else f"https://sleeper.com/leagues/{league_id}/league"
         st.markdown(f"[Open league in Sleeper]({link})")
-        st.caption("Data from the public Sleeper API, cached for 1 hour.")
 
     if not league_id.isdigit():
         st.error("Please enter a valid numeric Sleeper League ID.")
@@ -566,42 +658,91 @@ def main():
         st.error(f"Unexpected error while loading data: {exc}")
         st.stop()
 
+    try:  # non-fatal: without NFL state we simply treat every week as completed
+        nfl_state = fetch_nfl_state()
+    except SleeperAPIError:
+        nfl_state = {}
+
     if not rosters:
         st.warning("This league has no rosters yet.")
         st.stop()
 
+    active_week = get_active_week(league, nfl_state)
+    live_week = active_week if (active_week and is_week_in_progress()) else None
+
     names = build_names(users, rosters)
     managers = sorted(names.values(), key=str.lower)
-    games = build_games(matchups, names)
-    if not games:
+    games_all = build_games(matchups, names, live_week)
+    if not games_all:
         st.info("No regular-season games have been played yet for this league.")
         st.stop()
 
-    overall, h2h = compute_records(games, managers)
+    latest_played = max(g["week"] for g in games_all)
+    default_week = min(active_week, latest_played) if active_week else latest_played
+    default_week = max(1, min(default_week, last_week))
 
-    # Sleeper's season total PF (used for tiebreaks); fall back to computed PF.
-    computed_pf = {}
-    for g in games:
-        computed_pf[g["manager"]] = computed_pf.get(g["manager"], 0.0) + g["pf"]
-    total_pf = {}
-    for r in rosters:
-        s = r.get("settings") or {}
-        name = names[r["roster_id"]]
-        if "fpts" in s:
-            total_pf[name] = float(s.get("fpts") or 0) + float(s.get("fpts_decimal") or 0) / 100
-        else:
-            total_pf[name] = computed_pf.get(name, 0.0)
+    with st.sidebar:
+        st.subheader("📅 Week Controls")
+        through_week = st.selectbox(
+            "View Data Through Week",
+            options=list(range(1, last_week + 1)),
+            index=default_week - 1,
+            key=f"through_week_{league_id}_{last_week}",
+            format_func=lambda w: f"{w} (live)" if w == live_week else str(w),
+            help="Only matchups up to this week are processed.",
+        )
+        count_live = st.checkbox(
+            "Count in-progress week in H2H records",
+            value=False,
+            help="Off: W/L for a week still being played is not counted until it concludes.",
+        )
+        if active_week:
+            status = "in progress" if live_week else "between games / completed"
+            st.caption(f"Current NFL week: {active_week} ({status}).")
+        st.caption("Data from the public Sleeper API, cached for 1 hour.")
+
+    display_games = [g for g in games_all if g["week"] <= through_week]
+    live_in_view = any(g["live"] for g in display_games)
+    counted = [g for g in display_games if count_live or not g["live"]]
+
+    overall, h2h = compute_records(counted, managers)
+
+    # Tiebreak PF: Sleeper's season total when nothing is filtered out, otherwise the
+    # points from the games actually counted (so point-in-time views stay accurate).
+    computed_pf = {m: 0.0 for m in managers}
+    for g in counted:
+        computed_pf[g["manager"]] += g["pf"]
+    total_pf = dict(computed_pf)
+    if len(counted) == len(games_all):
+        for r in rosters:
+            s = r.get("settings") or {}
+            if "fpts" in s:
+                total_pf[names[r["roster_id"]]] = (
+                    float(s.get("fpts") or 0) + float(s.get("fpts_decimal") or 0) / 100
+                )
 
     groups = compute_standings(managers, overall, h2h, total_pf)
 
     season = league.get("season", "")
     subtitle = DEFAULT_LEAGUE_NAME if league_id == DEFAULT_LEAGUE_ID else league.get("name", DEFAULT_LEAGUE_NAME)
 
+    live_mode = None
+    if live_in_view:
+        live_mode = "included" if count_live else "excluded"
+
     tab1, tab2 = st.tabs(["🏈 Head-to-Head Madness", "📊 Points & Weekly Scoring"])
     with tab1:
-        render_h2h_tab(season, subtitle, managers, overall, h2h, groups)
+        render_h2h_tab(season, subtitle, managers, overall, h2h, groups, through_week, live_mode)
     with tab2:
-        render_scoring_tab(season, managers, games, list(range(1, last_week + 1)), total_pf)
+        render_scoring_tab(
+            season,
+            managers,
+            display_games,
+            counted,
+            list(range(1, through_week + 1)),
+            live_week if live_in_view else None,
+            count_live,
+        )
 
 
 main()
